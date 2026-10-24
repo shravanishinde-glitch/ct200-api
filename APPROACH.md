@@ -1,136 +1,202 @@
-# Approach document – CT-200 Manual API
 
-> Sections marked **[CONFIRM]** describe your own debugging history. Check them against what actually happened and
-> reword them in your own voice before submitting: the company will ask you to defend every line.
+# Approach Document — CT-200 Manual API
 
-## 1. Data model
+## 1. Data Model
 
-SQLite (SQLAlchemy):
-- `documents(name)` -> `document_versions(version_no, title, parser warnings)` -> `nodes`.
-- `nodes`: `id` (unique **per version row**), `logical_id` (stable identity across versions), `number`, `heading`, `level`,
-  `parent_id`, `order_index`, `body`, `tables_json`, `content_hash` (sha256 of normalized body + tables),
-  `change_status` (new/unchanged/changed vs previous version), `prev_node_id`, `warnings_json`, `page`.
-- `selections` -> `selection_items(node_id)`. A selection points at node **rows**, and a row belongs to exactly one
-  version, so a selection is version-pinned by construction. Re-ingesting only adds rows; nothing is updated or deleted.
+The application uses SQLite with SQLAlchemy to store documents, their versions, and extracted sections.
 
-Generated output (MongoDB, or JSON file when `MONGO_URI` is unset): one document per generation containing
-`selection_id`, `idempotency_key`, `prompt_version`, `model`, `status`, `attempts`, `warnings`, `raw_output`,
-`test_cases[]` (each with `source_node_ids`) and `sources[]` – a **snapshot** of every source section
-(node id, logical id, version, content hash and the full text at generation time).
-Why NoSQL: a generation is a nested blob, written once and read whole, never joined. Why a snapshot: staleness
-must be computable even if the relational rows change shape later, and a test case must always be traceable to the exact
-text it came from. Why a JSON-file fallback: the reviewer can run everything with zero infrastructure; both backends
-implement the same `insert/get/find` interface (`app/store.py`). The JSON store is not safe for multiple server
-processes (single process lock only) – fine for a demo, not for production.
+- `documents(name)` stores document information.
+- `document_versions(version_no, title, parser warnings)` records each version of a document.
+- `nodes` stores extracted sections. Each node has a version-specific ID and a `logical_id` that links the same section across versions. It also stores the section number, heading, hierarchy, body text, tables, content hash, change status, previous-node reference, warnings, and page number.
+- `selections` and `selection_items(node_id)` record which sections were selected for test generation.
 
-## 2. Parsing approach
+Each selection refers to specific node rows, so it remains associated with the version from which it was created. Ingestion adds new version records without overwriting earlier source data.
 
-**Tool: pdfplumber on the PDF text layer, not OCR.** The CT-200 PDF is born-digital (selectable text, font names, bounding
-boxes). Font names and geometry are *information OCR throws away*; OCR would add character errors in pressure
-values, which is the worst possible error in this domain. The assignment update explicitly allows "PDF parsing and/or OCR".
-Fallback behaviour: if no numbered sections are found (e.g. a scanned PDF), ingestion fails with 422 and stores nothing,
-rather than producing an empty or wrong tree. A production version would add an OCR path (e.g. page rasterisation +
-Tesseract) behind the same interface for scanned input.
+Generated results are stored in MongoDB when configured. If `MONGO_URI` is not set, the application uses a JSON file instead. Each generation record contains the selection ID, idempotency key, prompt version, model, status, attempts, warnings, raw output, test cases, and source snapshots.
 
-**Hierarchy reconstruction.** A line is a heading iff it matches `^\d+(\.\d+)*\.?\s+\S` **and** is entirely bold.
-Level = number of dots + 1. **Parent = longest existing numeric prefix**, not "the previous heading". Body lines go to the
-current heading; tables are detected geometrically, excluded from body text and attached to the heading *above* them.
+A generation is stored as a complete nested record, making a document database suitable for this data structure. Source snapshots preserve the original text and content hashes so that changes can be detected later. The JSON fallback makes the application easier to run without additional infrastructure. Both storage implementations use the same `insert/get/find` interface in `app/store.py`.
 
-**Irregularities found and how each is handled** (each has a test in `tests/test_parser.py`):
-| Irregularity | Handling |
+The JSON implementation uses a process-local lock. It is suitable for a demonstration but would need a different approach for concurrent production use.
+
+## 2. Parsing Approach
+
+### PDF Text Extraction
+
+The parser uses `pdfplumber` to extract text from the PDF's existing text layer instead of applying OCR. The CT-200 sample is a born-digital PDF with selectable text, font information, and character positions. These details help identify headings and tables. OCR could also introduce errors into important numerical values.
+
+The assignment permits PDF parsing and/or OCR, so text-layer extraction is sufficient for the supplied document.
+
+If the parser cannot find numbered sections, ingestion returns HTTP 422 without storing an empty or incorrect section tree. Scanned PDFs are not supported by the current parsing path. A future improvement would be to add OCR using a tool such as Tesseract behind the same parsing interface.
+
+### Reconstructing the Section Hierarchy
+
+A line is identified as a heading when it matches the numbered-section pattern `^\d+(\.\d+)*\.?\s+\S` and is entirely bold. The section number determines the hierarchy level.
+
+The parser identifies a parent by looking for the nearest existing numeric prefix instead of assuming that the previous heading is the parent. This supports documents with skipped levels and sections that appear out of order.
+
+Body lines are assigned to the current section. Tables are identified using page geometry, excluded from normal body text, and attached to the heading above them.
+
+### Document Irregularities and Handling
+
+| Case | Handling |
 |---|---|
-| Duplicate heading "Error Codes" (4.2 and 7.1) | Identity is the section **number**, never the title; two nodes, parents 4 and 7. |
-| Skipped level: 2.1.1.1 under 2.1 (no 2.1.1) | Parent = nearest existing ancestor (2.1); a parser warning is recorded on the node and the version. |
-| Out-of-order sections (3.4 appears before 3.3) | Order is kept as in the document; parent still correct; "out of order" warning recorded. |
-| Some headings are 11 pt, same size as body | Detection uses **bold + number pattern**, not font size. |
-| Cross-reference text like "see 2.1, 4.3" | Not a heading: not at line start / not bold. Test asserts exactly 27 nodes. |
-| Ligatures (ﬁ ﬂ) and non-breaking hyphens (CT‑200) | NFKC normalization + hyphen mapping before hashing/matching. |
-| Tables (2.1, 4.2), possibly continued over a page break | Cell grid kept in `tables_json`; nested fragment detections dropped; continuation rows merged with a warning. |
-| Page breaks moving text between pages | Hash is computed over normalized text, so a page-break shift in v2 is **not** a change (tested). |
+| The heading "Error Codes" appears in sections 4.2 and 7.1 | Section numbers distinguish the nodes, so both sections remain separate. |
+| Section 2.1.1.1 appears without section 2.1.1 | The nearest existing ancestor, 2.1, is used and a warning is recorded. |
+| Section 3.4 appears before 3.3 | Original document order is preserved and an out-of-order warning is recorded. |
+| A heading uses the same 11 pt font size as body text | Heading detection uses bold formatting and the numbering pattern rather than font size alone. |
+| Text contains references such as "see 2.1, 4.3" | Such references are not treated as headings unless they meet the heading rules. The parser test expects 27 nodes. |
+| Text contains ligatures or non-breaking hyphens | NFKC normalisation and hyphen mapping are applied before matching and hashing. |
+| Tables appear in sections 2.1 and 4.2, potentially across page breaks | Table data is stored in `tables_json`; nested fragments are filtered and continuation rows are merged with a warning. |
+| Text moves between pages in different versions | Hashing uses normalised text, so a page-break-only shift does not count as a content change. |
 
-**What the first implementation got wrong, how it was found, what changed [CONFIRM].** Things the code comments and
-tests show were fixed: (1) headings detected by font size missed 11 pt bold headings -> switched to bold + number;
-(2) "previous heading" parenting broke on the skipped level and out-of-order cases -> numeric-prefix parenting;
-(3) a table was attached to the last heading on its page instead of the one above it -> bbox ordering;
-(4) table fragments inside larger tables were double counted -> bbox containment filter; (5) table text leaked into
-body text -> lines inside table boxes are skipped; (6) ligatures made v1/v2 hashes differ for identical text -> NFKC.
-Discovery method: manual comparison of `pdftotext -layout` output with the parsed tree, the node-count assertion (27),
-v1 vs v2 hash comparisons, and unit tests per irregularity. **Not handled:** figures/images and captions – the CT-200
-sample has none; if they appeared they would be silently ignored, which is exactly the failure the brief warns about, so
-the safe next step is a validation that compares image count per page with captured figures and raises a warning.
+These cases are covered by the parser's tests. The implementation uses formatting and numbering for heading detection, numeric ancestry for parent selection, geometry for table placement, and normalisation before hashing.
 
-## 3. Versioning / matching strategy
-Pass A: same section **number** and heading similarity >= 0.6 -> same logical node. Pass B: for what is left, same *parent
-logical node* and heading similarity >= 0.85 -> same logical node (handles renumbering, e.g. 5.3 -> 5.4). Otherwise **new**;
-unclaimed old nodes are **removed**. Same logical node: equal hash = unchanged, else changed.
-Why: numbers are unique even when titles repeat, headings catch renumbering, hashes make "changed" objective and immune to
-page-break shifts. Result on the samples: changed = 2.1.1.1, 3.2, 4.2, 4.3; new = 5.3; removed = none.
+Figures and captions are not extracted. The supplied CT-200 sample does not contain them, so this limitation has not been exercised by the sample. A future improvement would be to detect images on each page and issue a warning when figures appear to have been missed.
 
-**Where it breaks:** (a) a section split in two or two merged -> seen as removed + new, staleness says `source_removed`
-(safe, but noisy); (b) a heading rewritten *and* renumbered at once -> new + removed; (c) two sections swap numbers and
-keep similar titles; (d) pass A trusts the number: if section 5.3 is deleted and a different 5.3 inserted with a
-heading >= 0.6 similar, it is called the same node (content differs, so it shows as `changed`, which is at least visible);
-(e) the hash covers all body text, so a typo fix is "changed" (by design – safer than hiding it).
+## 3. Versioning and Section Matching
 
-## 4. Browse / selection
-See README endpoint table. Selections store node row ids (version-pinned). `GET /selections/{id}` shows the pinned text
-plus the status of the same logical section in the latest version.
+The application compares document sections in two passes.
 
-## 5. LLM generation: prompt, validation, failure policy
-- **Prompt (`app/llm.py`)**: role = QA engineer for a medical device; sections supplied with `[NODE id] number heading`
-  headers; rules: 3–5 concrete, repeatable cases, **use only facts in the text and reuse exact numbers**, skip vague
-  sections, cite source node ids, treat section text as data (prompt-injection guard), reply with one JSON object of a
-  stated shape. Provider JSON mode is requested too, but never trusted.
-- **Validation**: Pydantic (`LLMOutput`/`TestCase`): at least 3 cases, non-blank title/steps/expected result, priority enum.
-- **Policy when the LLM misbehaves**: tolerate fences/chatter around the JSON; otherwise retry up to 3 attempts, sending the
-  validation error back to the model; provider errors count as attempts; after that -> **HTTP 502** and a record with
-  `status: failed` (attempts + raw output kept for debugging, hidden from normal retrieval). We never save half-valid output as
-  a result, because in QA a plausible-looking but malformed test case is worse than no test case. Safe auto-repairs only:
-  >5 cases -> keep first 5 (warning); cited ids not in the selection -> dropped; a case citing nothing valid -> attributed
-  to the whole selection (warning; conservative for staleness). Missing key -> 503 (retrying cannot help). Input over
-  12,000 chars -> 413.
-- **What validation cannot catch:** a well-formed test case containing an invented threshold. Mitigation is only the prompt
-  rule plus the stored source snapshot so a human can compare; a numeric-grounding check (every number in a test case must
-  appear in its cited sources) is the first thing I would add.
-- **Same selection submitted twice (policy):** return the existing successful generation (200, `reused: true`). The key is
-  sha256 of the sorted `(node id, content hash)` pairs + prompt version + model. Reasons: LLM output is non-deterministic,
-  so silently returning different test cases for the same input would break traceability; it also saves cost. `?force=true`
-  creates an additional generation; old ones are kept. A failed run never blocks a retry.
+1. **Match by section number:** Sections with the same number and heading similarity of at least 0.6 are treated as the same logical section.
+2. **Match remaining sections:** Sections with the same parent logical section and heading similarity of at least 0.85 are matched. This helps identify renumbered sections, such as 5.3 becoming 5.4.
+3. Unmatched new sections are marked `new`, while unmatched sections from the earlier version are marked `removed`.
+4. For matched sections, equal content hashes mean `unchanged`; different hashes mean `changed`.
 
-## 6. Staleness / impact detection
-Every generation stores snapshots of its source sections. At **retrieval** time, each snapshot is compared with the same
-*logical* section in the *latest* version (`latest_counterpart`):
-`fresh` (hash equal) · `possibly_stale` (text changed, wording only) · `stale` (any number changed, or a safety-relevant word
-such as not/must/within/before/cannot was added or removed) · `source_removed`.
-A test case = worst status over the sections it cites; a generation = worst over its test cases. Each source carries a reason
-and a word-level diff. Nothing is auto-cleared or regenerated (out of scope).
-**Does a one-word change equal a changed pressure threshold? No** – graded. But also not "safe": both are non-fresh and need
-a human look; the grade only helps prioritise. **Limits:** the classifier is a token heuristic, not semantics. It misses
-meaning flips not covered by the word list or the digit check (e.g. "two" -> "three", "before" -> a rephrased condition spelled
-differently), and it is section-granular: if a section has 10 requirements and one changes, every test case citing that
-section is flagged even if it only exercised the other nine. Citations come from the LLM, so a wrong citation means wrong
-impact; the fallback "whole selection" errs on the side of over-flagging. A change in a *different* section that alters the
-meaning of a cited one (e.g. a definition) is not detected.
+Section numbers help distinguish repeated headings. Heading similarity provides a fallback for renumbered sections, while normalised content hashes make comparisons less sensitive to page-break changes.
+
+For the supplied sample versions, the reported changed sections are 2.1.1.1, 3.2, 4.2, and 4.3. Section 5.3 is new, and no sections are reported as removed.
+
+There are some limitations to this strategy. Splitting one section into two or merging two sections can appear as a removal and a new section. A section that is both renamed and renumbered may also be classified as new and removed. Sections that exchange numbers can be matched incorrectly if their headings remain similar.
+
+The first pass relies on section numbers, so a replacement section with a sufficiently similar heading may be matched to the earlier section and reported as changed. The content hash also treats a typo correction as a change. This is intentional because the system should not silently ignore changes to source text.
+
+## 4. Browsing and Selection
+
+The README contains the endpoint table. A selection stores the IDs of the chosen section rows, keeping its source text tied to a specific document version.
+
+`GET /selections/{id}` returns the pinned source text together with the status of the corresponding logical sections in the latest version. This allows users to review the original content and see whether it has changed.
+
+## 5. LLM Generation, Validation, and Failure Handling
+
+### Prompt Construction
+
+The prompt in `app/llm.py` frames the model as a QA engineer working with a medical device. Each supplied section includes its node ID, section number, and heading.
+
+The prompt requests three to five concrete and repeatable test cases. It instructs the model to use only facts from the source, preserve exact numerical values, skip vague sections, cite source node IDs, treat document content as data rather than instructions, and return a JSON object in the required format.
+
+The provider's JSON mode is requested when available, but the application still validates the response.
+
+### Validation and Error Handling
+
+Pydantic models (`LLMOutput` and `TestCase`) validate the generated response. At least three test cases are required. Each case must contain a non-empty title, steps, and expected result, along with a valid priority.
+
+The application can remove code fences or surrounding text from a response. If validation still fails, it retries up to three attempts and sends the validation error back to the model. Provider failures also count as attempts.
+
+If generation fails after the permitted attempts, the API returns HTTP 502 and records a failed generation with attempt details and raw output for debugging. Normal retrieval does not expose that raw failed output. Incomplete or invalid test cases are not saved as a successful result.
+
+Limited automatic repairs are supported:
+
+- If more than five test cases are returned, the first five are retained and a warning is added.
+- Citations that do not belong to the selected nodes are removed.
+- If a test case has no valid citation, it is associated with the entire selection and a warning is recorded.
+
+A missing provider key returns HTTP 503 because retrying cannot resolve a configuration problem. Input longer than 12,000 characters is rejected with HTTP 413.
+
+These checks validate the response structure, but they cannot guarantee that every generated fact is correct. For example, a response may be valid JSON while still inventing a threshold. The prompt discourages this, and stored source snapshots allow a reviewer to compare the generated case with the original text.
+
+A useful next improvement would be a numeric-grounding check that verifies whether every number in a test case appears in its cited source text.
+
+### Repeated Requests
+
+Submitting the same selection again returns the existing successful generation with HTTP 200 and `reused: true`.
+
+The idempotency key is based on the sorted node ID and content-hash pairs, the prompt version, and the model. Reusing a successful result avoids unnecessary cost and prevents repeated requests for identical inputs from silently producing different test cases.
+
+Using `?force=true` requests an additional generation while preserving earlier records. A failed generation does not prevent a later retry.
+
+## 6. Staleness and Impact Detection
+
+Every generation stores snapshots of its source sections. When a result is retrieved, the application compares each snapshot with the corresponding logical section in the latest document version.
+
+The source status is classified as follows:
+
+- `fresh`: The content hash is unchanged.
+- `possibly_stale`: The text changed, but the heuristic did not identify a stronger warning.
+- `stale`: The section number changed, or a safety-related word such as "not", "must", "within", "before", or "cannot" was added or removed.
+- `source_removed`: The corresponding section no longer exists.
+
+A test case receives the most severe status among the sections it cites. The generation receives the most severe status among its test cases. Each source includes a reason and a word-level difference.
+
+The system does not automatically clear stale results or regenerate test cases.
+
+A one-word change is not automatically treated the same as a changed pressure threshold. However, every non-fresh result still needs human review. The classifier uses heuristics rather than fully understanding meaning. It may miss changes such as "two" becoming "three", or a condition being rephrased without using a recognised keyword.
+
+The check also operates at section level. If one requirement changes inside a section, all test cases citing that section may be flagged, even when they cover different requirements. The system relies on source citations from the model, so an incorrect citation can produce an incorrect impact assessment. If no valid citation remains, the whole selection is used as a conservative fallback.
+
+A change in another section that affects the meaning of a cited section is not detected by this comparison.
 
 ## 7. Retrieval
-`GET /selections/{id}/test-cases`, `GET /nodes/{id}/test-cases`, `GET /generations/{gid}` all return staleness computed live.
-The node route matches by **logical id**, so asking about the v2 node of 4.2 returns the test cases generated from v1 – this is
-the "what does this document change affect?" question.
 
-## 8. Decision log (drafts – rewrite in your own words)
-1. **Most likely silent wrong result:** the staleness classifier. A meaning-changing edit that contains no digit and no keyword
-   from my list is reported `possibly_stale` (looks harmless). Catch it: keep a labelled set of real v1->v2 edits and assert
-   the classifier's grade for each (the test suite has a few); in production, route every non-fresh case to review and
-   track how often reviewers upgrade `possibly_stale` to critical. Second candidate: LLM source citations.
-2. **Simplicity over correctness:** section-level (not requirement-level) granularity for staleness and hash; heuristic word list;
-   JSON-file store with a process-local lock; pdfplumber heuristics tailored to this one PDF. First to break in production:
-   concurrent writers on the JSON store (use Mongo) and the parser on the next differently formatted manual.
-3. **Input not handled:** a scanned/image-only PDF (ingestion rejects it with 422, nothing stored); also figures/captions are
-   not extracted. For the LLM: a selection whose text is vague gives vague tests – the system does not detect that, it only
-   validates shape. (Pick the one you can explain best.)
+The endpoints `GET /selections/{id}/test-cases`, `GET /nodes/{id}/test-cases`, and `GET /generations/{gid}` calculate staleness when results are retrieved.
 
-## 9. With more time
-Requirement-level (sentence/clause) nodes and hashes; numeric grounding check for generated test cases; semantic-diff
-(LLM-as-judge or embedding) as a *second opinion* on `possibly_stale`; OCR fallback path; figure/caption extraction with
-a per-page image-count validation; Alembic migrations; background job for generation; Mongo indexes on `selection_id` /
-`logical_ids`; real concurrency tests.
+The node endpoint matches sections by logical ID. For example, requesting the v2 node for section 4.2 can return test cases generated from its v1 counterpart. This helps answer the question: "Which existing tests might be affected by this document change?"
+
+## 8. Decision Log
+
+### 1. What could silently produce a misleading result?
+
+The main risk is the staleness classifier. It relies on keyword and number checks, so a meaningful change that does not match those rules could be labelled `possibly_stale` instead of `stale`.
+
+To reduce this risk, I would test the classifier against labelled before-and-after edits and require human review for every result that is not fresh. Recording cases where reviewers upgrade a `possibly_stale` result would also help identify weaknesses in the rules.
+
+Incorrect source citations from the model are another risk because the impact check depends on those citations.
+
+### 2. Where did I choose a simpler design, and what did the runs show?
+
+The staleness check works at section level instead of tracking individual requirements. In one observed run, all five test cases were marked stale even though only the E3 timing and the new E6 row changed in section 4.2.
+
+This happened because the system flags test cases based on the section they cite. It does not know which individual requirement each test case exercises. Tracking requirements separately could reduce these unnecessary warnings, but it would require a more detailed data model and matching process.
+
+The application also provides a JSON-file storage option and uses PDF-layout heuristics designed around the supplied manual. These choices keep the demo straightforward to set up, but the JSON store is not suitable for concurrent writers across multiple server processes, and the parser may need changes for a differently formatted manual.
+
+For production, I would use a database configuration suitable for concurrent access and test the parser against a wider variety of documents.
+
+### 3. What real failure did I observe, and how did the system respond?
+
+During a generation run, the Groq model became unavailable and the provider request failed. The API returned HTTP 502, retained the attempt log for debugging, and did not save the failed response as a successful test-case result.
+
+This is the intended failure behaviour: preserve the information needed to investigate the problem without presenting incomplete or unreliable test cases as a successful result.
+
+The parser also rejects scanned or image-only PDFs with HTTP 422 rather than creating an empty section tree. Figures and captions are not extracted either. These are known input limitations, not failures I am claiming occurred during the sample run.
+
+If broader PDF support were needed, I would add OCR and figure/caption validation.
+
+## 9. Sample Run Observations
+
+The observed runs demonstrated two important behaviours.
+
+### Section Change and Staleness
+
+In section 4.2, the E3 timing was changed and a new E6 row was added. All five test cases were marked stale because they cited the changed section.
+
+This demonstrates the current section-level limitation: the system flags test cases by their cited section rather than identifying the precise requirement each test case covers.
+
+### Provider Failure
+
+When the Groq model call failed, the API returned HTTP 502, retained the attempt log, and did not save the unsuccessful response as a successful generation.
+
+The available notes do not include a complete step-by-step transcript or the exact output from step 7. The observations above are therefore documented without inventing additional console output.
+
+## 10. Future Improvements
+
+With more time, I would prioritise the following improvements:
+
+1. Track individual requirements using separate nodes and content hashes.
+2. Add numeric grounding checks for generated test cases.
+3. Use semantic comparison as a second opinion for results labelled `possibly_stale`.
+4. Add OCR support for scanned PDFs.
+5. Extract figures and captions and validate image counts per page.
+6. Introduce database migrations using Alembic.
+7. Move test generation into a background job.
+8. Add MongoDB indexes for selection and logical-section lookups.
+9. Test concurrent requests and storage writes.
