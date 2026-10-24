@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db, init_db
 from app.ingest import ingest_pdf
 from app.models import DocumentVersion, Node, Selection, SelectionItem
+from app.generation_api import router as generation_router
 from app.queries import detail, get_document, get_node, resolve_version, source_status, summary
 from app.versioning import diff_summary, node_text
 
@@ -23,6 +24,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="CT-200 Manual API", lifespan=lifespan)
+app.include_router(generation_router)
 
 
 def _text(n: Node) -> str:
