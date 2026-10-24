@@ -2,3 +2,6 @@
 __pycache__/
 *.db
 .env
+generations.json
+generations.json.tmp
+.pytest_cache/
