@@ -51,3 +51,24 @@ class Node(Base):
     page: Mapped[int] = mapped_column(default=0)
     version: Mapped[DocumentVersion] = relationship(back_populates="nodes")
     parent: Mapped[Optional["Node"]] = relationship(foreign_keys=[parent_id], remote_side=[id])
+
+
+class Selection(Base):
+    """A named set of sections. Each item points at a Node ROW, which belongs to exactly one version,
+    so a selection stays pinned to the exact text the user picked even after newer versions are ingested."""
+    __tablename__ = "selections"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    items: Mapped[list["SelectionItem"]] = relationship(back_populates="selection", cascade="all, delete-orphan",
+                                                        order_by="SelectionItem.id")
+
+
+class SelectionItem(Base):
+    __tablename__ = "selection_items"
+    __table_args__ = (UniqueConstraint("selection_id", "node_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    selection_id: Mapped[int] = mapped_column(ForeignKey("selections.id"))
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"))
+    selection: Mapped[Selection] = relationship(back_populates="items")
+    node: Mapped[Node] = relationship()

@@ -9,6 +9,8 @@ from app.versioning import match_versions
 def ingest_pdf(db: Session, doc_name: str, pdf_path: str, source_name: str = "") -> DocumentVersion:
     """Parse a PDF and store it as a NEW version of `doc_name`. Earlier versions are never modified or deleted."""
     parsed = parse_pdf(pdf_path)
+    if not parsed["nodes"]:
+        raise ValueError("No numbered sections found (scanned, empty or unsupported PDF?). Nothing was stored.")
 
     doc = db.scalar(select(Document).where(Document.name == doc_name))
     if doc is None:
